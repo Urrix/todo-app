@@ -1,0 +1,139 @@
+trigger:
+- main
+ 
+pool:
+  vmImage: ubuntu-latest
+ 
+variables:
+  SONARQUBE_CONTAINER_NAME: 'sonarqube' # Nombre del contenedor de SonarQube
+  SONARQUBE_PORT: '9000'  # Puerto en el que se ejecutará SonarQube
+  PROJECT_NAME: 'prueba'  # Nombre del proyecto en SonarQube
+  PROJECT_KEY: 'prueba'  # Clave única del proyecto en SonarQube
+ 
+steps:
+#Descargar el código fuente desde el repositorio de Azure DevOps
+- checkout: self
+ 
+- task: JavaToolInstaller@1
+  inputs:
+    versionSpec: '17'
+    jdkArchitectureOption: 'x64'
+    jdkSourceOption: 'PreInstalled'
+  displayName: 'instalar java 17'
+ 
+- script: |
+    echo "Verificando instalación de Java"
+    java -version
+  displayName: 'Verificar Java'
+ 
+- script: |
+    echo "Instalando Maven..."
+    sudo apt-get update
+    sudo apt-get install -y maven
+  displayName: 'Instalar Maven'
+ 
+- script: |
+    echo "Verificando instalación de Maven..."
+    mvn -version
+  displayName: 'Verificar Maven'
+ 
+#Levantar un contenedor Docker con SonarQube en el puerto 9000
+- script: |
+    echo "Iniciando contenedor de SonarQube..."
+    docker run -d --name $(SONARQUBE_CONTAINER_NAME) -p $(SONARQUBE_PORT):9000 sonarqube:community
+  displayName: 'Levantar contenedor SonarQube'
+ 
+#Esperar a que el servicio de SonarQube esté completamente operativo
+- script: |
+    echo "Esperando a que SonarQube esté listo..."
+    until curl -f http://localhost:$(SONARQUBE_PORT)/api/system/status | grep -q '"status":"UP"'; do
+      sleep 15
+      echo "Esperando..."
+    done
+    sleep 30 # Espera adicional
+    echo "SonarQube está listo!"
+  displayName: 'Esperar inicio de SonarQube'
+  timeoutInMinutes: 5
+ 
+#Generar un token de autenticación en SonarQube para la integración con el pipeline
+- script: |
+    echo "Generando token de autenticación..."
+    TOKEN=$(curl -u admin:admin -X POST "http://localhost:$(SONARQUBE_PORT)/api/user_tokens/generate" \
+      -d "name=azure-devops" -d "type=GLOBAL_ANALYSIS_TOKEN" | jq -r '.token')
+    echo "##vso[task.setvariable variable=SONAR_TOKEN;issecret=true]$TOKEN"
+    echo "Token generado exitosamente"
+  displayName: 'Generar token SonarQube'
+  env:
+    SONARQUBE_PASSWORD: 'admin'
+ 
+#Ejecutar el análisis de código con Maven y SonarQube
+- script: |
+    mvn clean verify sonar:sonar \
+      -Dsonar.host.url=http://localhost:9000 \
+      -Dsonar.login=$(SONAR_TOKEN) \
+      -Dsonar.projectKey=$(PROJECT_KEY) \
+      -Dsonar.projectName='$(PROJECT_NAME)' \
+      -Dsonar.java.source=17 \
+      -Dsonar.sourceEncoding=UTF-8 \
+      -Dsonar.projectCreation.auto=true
+  displayName: 'Ejecutar análisis SonarQube'
+  env:
+    SONAR_TOKEN: $(SONAR_TOKEN)
+ 
+ 
+ 
+#Descargar el informe de SonarQube en formato JSON
+- script: |
+    echo "Descargando reporte de SonarQube..."
+    
+    # Esperar a que el análisis esté completo
+    echo "Verificando estado del análisis..."
+    for i in {1..30}; do
+      ANALYSIS_STATUS=$(curl -sS -u admin:admin "http://localhost:$(SONARQUBE_PORT)/api/ce/component?component=$(PROJECT_KEY)" | jq -r '.current.status')
+      
+      if [ "$ANALYSIS_STATUS" = "SUCCESS" ]; then
+        echo "Análisis completado con éxito"
+        break
+      elif [ "$ANALYSIS_STATUS" = "FAILED" ]; then
+        echo "##vso[task.logissue type=error]El análisis falló"
+        echo "##vso[task.complete result=Failed;]"
+        exit 1
+      else
+        echo "Estado del análisis: $ANALYSIS_STATUS (intento $i/30)"
+        sleep 5
+      fi
+      
+      if [ $i -eq 30 ]; then
+        echo "##vso[task.logissue type=error]Timeout esperando análisis"
+        echo "##vso[task.complete result=Failed;]"
+        exit 1
+      fi
+    done
+    
+    
+    # Descargar issues encontrados
+    curl -sS -u admin:admin \
+      "http://localhost:$(SONARQUBE_PORT)/api/issues/search?componentKeys=$(PROJECT_KEY)&resolved=false" \
+      -o sonar_issues_report.json
+    
+    echo "Reportes descargados:"
+    ls -la *.json
+  displayName: 'Descargar reportes de SonarQube'
+  env:
+    SONAR_TOKEN: $(SONAR_TOKEN)
+ 
+ 
+- task: PublishPipelineArtifact@1
+  displayName: 'Publicar reporte de issues'
+  inputs:
+    targetPath: 'sonar_issues_report.json'
+    artifact: 'SonarQubeIssuesReport'
+    publishLocation: 'pipeline'
+ 
+#Eliminar el contenedor de SonarQube al final del pipeline
+- script: |
+    echo "Eliminando contenedor de SonarQube..."
+    docker stop $(SONARQUBE_CONTAINER_NAME)
+    docker rm $(SONARQUBE_CONTAINER_NAME)
+  displayName: 'Eliminar contenedor de SonarQube'
+  condition: always() ## Se ejecutará siempre, incluso si fallan pasos anteriores
